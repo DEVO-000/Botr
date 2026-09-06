@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# GOST-ASSISTANT v3.5 — «академический эксперт»: реальные источники из 10+ каталогов,
+# GOST-ASSISTANT v3.6 — «академический эксперт»: реальные источники из 10+ каталогов,
 # честная библиография без фабрикаций, ГОСТ 7.32-2017 / Р 7.0.100-2018 / Р 7.0.5-2008.
 # История изменений: см. CHANGES.md
 
@@ -686,7 +686,7 @@ DOC_TYPES = {
         "word": "ДОКЛАД",
         "min_pages": 5,
         "max_pages": 15,
-        "structure": "Введение · Основная часть · Заключение",
+        "structure": "Введение · 2 раздела по теме · Заключение · Список источников",
         "desc": "Краткий обзор темы для устного выступления",
     },
     "esse": {
@@ -694,7 +694,7 @@ DOC_TYPES = {
         "word": "ЭССЕ",
         "min_pages": 3,
         "max_pages": 10,
-        "structure": "Вступление · Аргументы · Авторская позиция",
+        "structure": "Введение · 2 раздела с аргументацией · Заключение · Список источников",
         "desc": "Авторский взгляд на проблему с аргументацией и личными выводами",
     },
     "kontrolnaya": {
@@ -1175,10 +1175,11 @@ def get_user_limits_info(user_id: int) -> str:
         period_s = f"{period_h // 24} дн" if period_h >= 24 else f"{period_h} ч"
         free_str = f"✅ Доступна (1 раз в {period_s})"
 
-    # Платный режим удалён — в статусе остаётся только честный бесплатный.
+    # В статусе показываем оба режима: бесплатный и платный (платный вернули).
     return (
         "┌─────────────────────────\n"
         f"│ 🆓 Бесплатно: {free_str}\n"
+        "│ ⭐ Платно: доступно\n"
         "└─────────────────────────"
     )
 
@@ -3273,6 +3274,70 @@ async def generate_chapter_titles(
     )
 
 
+async def _generate_flat_section_titles(
+    model_key: str,
+    doc_type: str,
+    topic: str,
+    subject: str,
+    num_sections: int = 2,
+) -> list[dict]:
+    """Для эссе/доклада: 2 развёрнутых раздела по теме БЕЗ подглав.
+
+    Раньше у эссе и доклада были жёстко зашитые одинаковые заголовки
+    («1. Теоретические основы…», «ОСНОВНАЯ ЧАСТЬ») — работа не по ГОСТ,
+    названия не зависели от темы. Теперь названия придумывает ИИ под тему,
+    а при сбое — осмысленный тематический фоллбэк.
+    """
+    genre = DOC_TYPES.get(doc_type, {}).get("word", "РАБОТА")
+    focus = (
+        "Раздел 1 раскрывает первый аргумент с фактами; Раздел 2 — второй аргумент, "
+        "контраргументы и авторскую позицию."
+        if doc_type == "esse"
+        else "Раздел 1 — ключевые понятия и теоретическая база; Раздел 2 — факты, "
+             "статистика и примеры из практики."
+    )
+    system = (
+        "Ты помогаешь составлять структуру академической работы по ГОСТ 7.32-2017. "
+        "Отвечай СТРОГО в формате JSON-массива без пояснений и без markdown. "
+        "Каждый элемент: {\"title\": \"...\", \"subs\": []}. "
+        "Нумерация по ГОСТ: «1 Название раздела», «2 Название раздела» — без точки "
+        "после цифры, без слова «Глава». Названия развёрнутые, конкретные, по теме."
+    )
+    user = (
+        f"Тема работы: «{topic}». Дисциплина: {subject}. Тип работы: {genre}. "
+        f"Нужно ровно {num_sections} раздела. {focus} "
+        f"Язык: русский. Верни ТОЛЬКО JSON-массив."
+    )
+    try:
+        raw, _ = await chat_with_fallback(
+            model_key,
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=700,
+        )
+        res = StructureGenerator.parse_structure_json(raw or "")
+    except Exception as e:
+        print(f"[FLAT-TITLES] ИИ недоступен ({e}) — тематический фоллбэк")
+        res = []
+    if res and len(res) >= 2:
+        flat = [{"title": str(r.get("title") or "").strip(), "subs": []} for r in res[:num_sections]]
+        flat = [r for r in flat if r["title"]]
+        if len(flat) >= 2:
+            return _dedupe_chapter_titles(flat)
+
+    # Тематический фоллбэк (не «общий» — тема и дисциплина в названии)
+    if doc_type == "esse":
+        fallback = [
+            {"title": f"1 Постановка проблемы «{topic}» и первый аргумент", "subs": []},
+            {"title": f"2 Второй аргумент, контраргументы и авторская позиция", "subs": []},
+        ]
+    else:
+        fallback = [
+            {"title": f"1 Ключевые понятия и теоретические основы темы «{topic}»", "subs": []},
+            {"title": f"2 Факты, статистика и практические примеры по теме «{topic}»", "subs": []},
+        ]
+    return _dedupe_chapter_titles(fallback)
+
+
 async def verify_discipline_relevance(
     model_key: str,
     topic: str,
@@ -3643,7 +3708,8 @@ def build_prompts(
             "lit_review": strict_prompt(
                 f"Раздел 'Обзор литературы' (Literature Review) для научной статьи «{topic}». "
                 f"Проанализируй исследования отечественных и зарубежных авторов за последние годы. "
-                f"Используй ГОСТ-сноски только с номерами страниц: [1, с. 45], [2, с. 120].",
+                f"Ссылки ставь только формата [N] по номерам из проверенного списка источников. "
+                f"ЗАПРЕЩЕНО придумывать страницы [N, с. 45] и новые источники.",
                 lit_review_chars,
                 writing_style, doc_type,
             ),
@@ -10181,6 +10247,7 @@ async def _expand_blocks_by_chars(
     model_key: str,
     writing_style: str,
     prog: "Progress" | None = None,
+    extra_attempts: int = 0,
 ) -> list[tuple]:
     """Дозаписывает текст в основные главы, чтобы добрать chars_to_add символов."""
     if chars_to_add <= 0:
@@ -10227,7 +10294,9 @@ async def _expand_blocks_by_chars(
         f"Ты профессионально пишешь академический текст на русском языке в стиле «{style_label}». "
         "СТРОГО: без markdown (никаких **, ##, ---, ```), "
         "без заголовков, без буллетов и нумерованных списков. "
-        "Используй ГОСТ-сноски только с номерами страниц: [1, с. 45], [2, с. 77], [3, с. 120] в тексте. "
+        "Ссылки ставь ТОЛЬКО в формате [N], где N — номер из уже имеющегося списка литературы. "
+        "ЗАПРЕЩЕНО придумывать страницы вида [N, с. 45] — реальных страниц ты не знаешь. "
+        "ЗАПРЕЩЕНО придумывать новые источники, авторов, названия, годы и DOI. "
         "Только сплошной академический текст, абзацами по 5–8 развёрнутых предложений."
     )
 
@@ -10241,7 +10310,8 @@ async def _expand_blocks_by_chars(
             await prog.update(label=f"➕ Дописываю «{title[:30]}…»", force=True)
 
         attempts = 0
-        max_attempts = 3
+        max_attempts = 3 + max(0, int(extra_attempts))
+        gained_total = 0
         while need > 100 and attempts < max_attempts:
             attempts += 1
             tail = text[-800:] if text else ""
@@ -10283,6 +10353,7 @@ async def _expand_blocks_by_chars(
                 continue
             text = (text.rstrip() + "\n\n" + extra) if text else extra
             need -= len(extra)
+            gained_total += len(extra)
 
         # Обновляем блок
         if blocks[i][3]:
@@ -10378,9 +10449,13 @@ async def precise_page_adjustment(
     # FIX (банкротство): если две итерации подряд не меняют ни страницы,
     # ни объём текста (LibreOffice молча падает / модель не добавляет текст),
     # цикл выжигал все 30 попыток впустую — деньги на API и время пользователя.
-    # Теперь при «стойле» 2 итерации подряд выходим с честным логом.
+    # Теперь при «стойле» 2 итерации подряд включаем ЭСКАЛАЦИЮ (глубже режем /
+    # агрессивнее дописываем), и только если она тоже не двигает результат —
+    # выходим с честным логом.
     _prev_snap: tuple | None = None
     _stall = 0
+    _stall_limit = 3
+    _escalated = False
 
     for it in range(max_iters):
         # Измеряем текущее количество страниц
@@ -10393,19 +10468,49 @@ async def precise_page_adjustment(
         diff = real_pages - target_pages
         print(f"[ADJUST] Итерация {it+1}: цель={target_pages}, факт={real_pages}, разница={diff:+d}")
 
+        # Вместимость страницы нужна и в детекторе буксования (эскалация),
+        # и в основном цикле — считаем ОДИН раз в начале итерации.
+        chars_per_real_page = calculate_chars_per_page(gost)
+
         # ── Детектор буксования ──
         _snap = (real_pages, _blocks_text_total(blocks))
         if _prev_snap is not None and _snap == _prev_snap:
             _stall += 1
-            print(f"[ADJUST] ⚠️ Без прогресса ({_stall}/2): страницы и объём не изменились")
-            if _stall >= 2:
+            print(f"[ADJUST] ⚠️ Без прогресса ({_stall}/{_stall_limit}): страницы и объём не изменились")
+            if _stall >= _stall_limit:
+                if not _escalated:
+                    # Эскалация: одна агрессивная попытка в нужную сторону.
+                    _escalated = True
+                    _stall = 0
+                    if diff > 0:
+                        print("[ADJUST] 🚨 Эскалация: глубокая обрезка floor=0.30")
+                        blocks = _trim_blocks_by_chars(
+                            blocks, max(1, int(abs(diff) * chars_per_real_page)),
+                            floor_ratio=0.30,
+                        )
+                        docx_raw = await asyncio.to_thread(build_docx_bytes, data, blocks, gost)
+                        with open(tmp_in, "wb") as f:
+                            f.write(docx_raw)
+                        continue
+                    else:
+                        print("[ADJUST] 🚨 Эскалация: усиленная дозапись (больше попыток на блок)")
+                        blocks = await _expand_blocks_by_chars(
+                            blocks, abs(diff) * chars_per_real_page,
+                            topic, model_key, writing_style, prog,
+                            extra_attempts=3,
+                        )
+                        docx_raw = await asyncio.to_thread(build_docx_bytes, data, blocks, gost)
+                        with open(tmp_in, "wb") as f:
+                            f.write(docx_raw)
+                        continue
                 print(
-                    f"[ADJUST] ⛔ Подгонка буксует: результат не меняется. "
+                    f"[ADJUST] ⛔ Подгонка буксует даже после эскалации. "
                     f"Выход после {it+1} итераций ({real_pages} стр. вместо {target_pages})."
                 )
                 break
         else:
             _stall = 0
+            _escalated = False
         _prev_snap = _snap
         
         if prog:
@@ -10423,9 +10528,6 @@ async def precise_page_adjustment(
             pass  # continue to trim
         # Никаких «почти совпало»: пользователь заказал точное число страниц.
         # Продолжаем подгонку, пока diff не станет 0 или пока не исчерпаны итерации.
-        
-        # Рассчитываем сколько символов нужно добавить/убрать
-        chars_per_real_page = calculate_chars_per_page(gost)
         
         if diff > 0:
             # Слишком много страниц — обрезаем. Множитель 1.0 (раньше 0.8) —
@@ -10483,7 +10585,9 @@ async def precise_page_adjustment(
     # Финальный замер
     final_pages = await measure_pages_async(tmp_in, measure_dir)
     if final_pages is None:
-        final_pages = target_pages
+        # НЕ подставляем цель как факт: честная оценка по объёму текста.
+        final_pages = max(1, target_pages_from_chars(_blocks_text_total(blocks), gost))
+        print(f"[ADJUST] Замер недоступен — оценка по объёму текста: {final_pages} стр.")
     
     print(f"[ADJUST] 🎯 Финальный результат: {final_pages} страниц")
 
@@ -10628,10 +10732,12 @@ def kb_doc_type_more() -> InlineKeyboardMarkup:
 
 
 def kb_mode() -> InlineKeyboardMarkup:
-    # Честное меню: кнопки «Платный режим (безлимит)» больше нет, а слово
-    # «быстро» убрано — генерация занимает минуты, обещать скорость нельзя.
+    # Два режима: бесплатный (с лимитом страниц/кулдауном) и платный
+    # (выбор модели, большее число страниц). Оценки скорости в меню НЕ даём:
+    # «быстро/за 5–20 минут» — обещание, которое мы не контролируем.
     b = InlineKeyboardBuilder()
     b.button(text="🆓 Бесплатно", callback_data="mode_free")
+    b.button(text="⭐ Платно", callback_data="mode_paid")
     b.adjust(1)
     return b.as_markup()
 
@@ -11401,7 +11507,7 @@ def _welcome_text(user_id: int, first_name: str) -> str:
         f"<b>Что умею:</b>\n"
         f"• 📄 Рефераты, курсовые, эссе, доклады\n"
         f"• 📑 Развёрнутые названия глав и подглав\n"
-        f"• 📐 Точное соблюдение объёма (±10%)\n"
+        f"• 📐 Объём подгоняется под запрошенное число страниц\n"
         f"• 🗂 Автоматическое содержание\n"
         f"• ⚙️ Настройка ГОСТ под ваш вуз\n\n"
         f"{limits}\n\n"
@@ -11431,19 +11537,20 @@ def _mode_free_text() -> str:
         "🆓 <b>Бесплатный режим</b>\n\n"
         f"• Модель: {AI_MODELS.get(FREE_MODEL_KEY, {}).get('name', 'DeepSeek')}\n"
         f"• Максимум: <b>{FREE_MAX_PAGES} страниц</b>\n"
-        f"• Лимит: <b>1 генерация раз в {period_s}</b>\n"
-        "• Честно о времени: генерация занимает примерно 5–20 минут "
-        "(зависит от объёма работы)\n\n"
+        f"• Лимит: <b>1 генерация раз в {period_s}</b>\n\n"
         "✍️ Введите <b>тему работы</b> одной строкой:"
     )
 
 
 def _mode_paid_text() -> str:
-    paid_str = "♾ безлимитно" if PAID_DAILY_LIMIT == 0 else f"{PAID_DAILY_LIMIT} в день"
+    # Честно и без «бесконечных» обещаний: описываем фактические лимиты тарифа.
+    paid_str = (
+        "без дневного лимита" if PAID_DAILY_LIMIT == 0 else f"{PAID_DAILY_LIMIT} в день"
+    )
     return (
         "⭐ <b>Платный режим</b>\n\n"
         f"• Любая доступная модель ИИ\n"
-        f"• Любое количество страниц\n"
+        f"• Расширенный объём работы\n"
         f"• Генерации: <b>{paid_str}</b>\n\n"
         "✍️ Введите <b>тему работы</b> одной строкой:"
     )
@@ -12618,9 +12725,9 @@ async def h_custom_doc_name(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("mode_"))
 async def h_mode(cb: CallbackQuery, state: FSMContext) -> None:
     mode = cb.data.replace("mode_", "", 1)
-    # Платный режим убран из меню. Если пользователь нажал старую кнопку
-    # «Платный режим» в старом сообщении — безопасно переводим в бесплатный.
-    if mode != "free":
+    # Платный режим ВЕРНУТ по обратной связи. Неизвестные старые колбэки
+    # безопасно переводим в бесплатный.
+    if mode not in ("free", "paid"):
         mode = "free"
     await state.update_data(mode=mode)
 
@@ -12641,7 +12748,7 @@ async def h_writing_style(cb: CallbackQuery, state: FSMContext) -> None:
 
     data = await state.get_data()
     mode = data.get("mode", "free")
-    text = _mode_free_text()  # платный режим удалён — всегда бесплатный
+    text = _mode_paid_text() if mode == "paid" else _mode_free_text()
     style_label = "🎓 Умный стиль выбран" if style == "smart" else "📝 Классический стиль выбран"
 
     await cb.message.edit_text(
@@ -13565,7 +13672,7 @@ async def h_image_count_text(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     pages = int(data.get("pages", 10))
     mode = data.get("mode", "free")
-    # Платный режим удалён: остаёмся в бесплатном (раньше был скрытый апгрейд).
+    # Платный режим работает как обычно: ветка ниже разветвляет free/paid.
 
     if mode == "free":
         ok, reason = check_user_limit(message.from_user.id, "free")
@@ -14050,6 +14157,13 @@ async def generate_and_send(
             else:
                 chapter_titles = []
                 structure = []
+                # ЭССЕ и ДОКЛАД: раньше был один безликий «ОСНОВНАЯ ЧАСТЬ»
+                # или зашитые заголовки — не по ГОСТ и не по теме. Теперь
+                # придумываем 2 развёрнутых раздела под тему (по ГОСТ 7.32).
+                if doc_type in ("esse", "doklad"):
+                    chapter_titles = await _generate_flat_section_titles(
+                        model_key, doc_type, topic, subject, num_sections=2,
+                    )
             await prog.update(step_done=True)
 
             # ════════════════════════════════════════════════
@@ -14058,7 +14172,9 @@ async def generate_and_send(
             _structure_approved = data.get("structure_approved", False)
             # ФИКС: флаг HUMAN_IN_LOOP_ENABLED читался из конфига, но не
             # проверялся — утверждение структуры нельзя было отключить.
-            if not _structure_approved and chapter_titles and HUMAN_IN_LOOP_ENABLED:
+            # Гейт действует только для полных структур (с главами/подглавами);
+            # у эссе/доклада structure пуст — плоские разделы идут без опроса.
+            if not _structure_approved and structure and chapter_titles and HUMAN_IN_LOOP_ENABLED:
                 try:
                     _approval_data = pipeline.build_approval_data(
                         structure or [],

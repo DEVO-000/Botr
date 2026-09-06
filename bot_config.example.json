@@ -1,0 +1,11 @@
+{
+  "BOT_TOKEN": "123456789:ЗДЕСЬ_ВАШ_ТОКЕН_ОТ_BOTFATHER",
+  "OPENROUTER_KEY": "",
+  "DEEPSEEK_KEY": "",
+  "GROQ_KEY": "",
+  "ADMIN_CHAT_ID": "",
+  "VIP_USERS": "5291613279",
+  "PIXABAY_KEY": "",
+  "PEXELS_KEY": "",
+  "ENABLE_WEB_SOURCES": "1"
+}

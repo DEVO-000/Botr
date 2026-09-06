@@ -1,0 +1,49 @@
+=== КАКИЕ ФАЙЛЫ ЗАГРУЖАТЬ НА ХОСТИНГ ===
+
+Загрузите ВСЕ файлы из этой папки (кроме __pycache__). Обязательно:
+  - все файлы .py
+  - requirements.txt
+  - gost_configs.json
+  - apt.txt (если хостинг умеет ставить системные пакеты, напр. Render/Railway)
+  - bot_config.example.json (переименуйте в bot_config.json и вставьте ключи — см. ниже)
+
+Загружать НЕ нужно: __pycache__, папки с тестами (test_*.py можно, они не мешают).
+
+=== ГДЕ ВЗЯТЬ КЛЮЧИ (ИИ-МОДЕЛИ) ===
+
+Бот читает ключи из ТРЁХ мест (по приоритету):
+  1. переменные окружения хостинга
+  2. файл .env рядом с main.py
+  3. файл bot_config.json рядом с main.py
+
+Минимально нужен BOT_TOKEN (от @BotFather), иначе бот не запустится.
+Без ключей ИИ пользователи увидят «ИИ-модели не настроены» — это НЕ ошибка
+кода, а отсутствие ключей.
+
+Вариант A — файл .env (проще всего):
+  BOT_TOKEN=123456789:ВАШ_ТОКЕН
+  DEEPSEEK_KEY=sk-...
+  OPENROUTER_KEY=sk-or-...
+  GROQ_KEY=gsk_...
+
+Вариант B — файл bot_config.json:
+  возьмите bot_config.example.json, переименуйте в bot_config.json
+  и вставьте ключи в поля BOT_TOKEN / OPENROUTER_KEY / DEEPSEEK_KEY / GROQ_KEY.
+
+Вариант C — переменные окружения на хостинге:
+  настройте BOT_TOKEN, OPENROUTER_KEY, DEEPSEEK_KEY, GROQ_KEY в панели хостинга.
+
+Полезно: PIXABAY_KEY / PEXELS_KEY (бесплатные, для авто-подбора картинок).
+
+=== ЗАПУСК ===
+
+  pip install -r requirements.txt
+  python3 main.py
+
+Проверка ключей без запуска бота:
+  python3 diagnose_models.py
+
+Где взять бесплатные ключи:
+  - DeepSeek: https://platform.deepseek.com (DEEPSEEK_KEY)
+  - OpenRouter: https://openrouter.ai/keys (OPENROUTER_KEY, даёт доступ к DeepSeek R1 и Gemini)
+  - Groq: https://console.groq.com/keys (GROQ_KEY)

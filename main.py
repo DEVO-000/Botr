@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# GOST-ASSISTANT v3.6 — «академический эксперт»: реальные источники из 10+ каталогов,
+# GOST-ASSISTANT v3.7 — «академический эксперт»: реальные источники из 10+ каталогов,
 # честная библиография без фабрикаций, ГОСТ 7.32-2017 / Р 7.0.100-2018 / Р 7.0.5-2008.
 # История изменений: см. CHANGES.md
 
@@ -985,9 +985,21 @@ ACADEMIC_REFERENCING_SYSTEM_PROMPT = """ТЫ — ЭКСПЕРТ ПО АКАДЕ�
 # ФУНКЦИИ ЗАЩИТЫ ОТ ПЕРЕГРУЗКИ API
 # ═══════════════════════════════════════════════════════════════
 
-# Глобальный счётчик ошибок для определения перегрузки
-_api_overload_counter = {}
-_api_overload_timestamps = {}
+# FIX (v3.7, «бот не видит ИИ»): старая логика вела себя как «смертная спираль»:
+#   1) после любого 429 статус LIMIT «залипал» навсегда;
+#   2) chat_with_model при пустом ответе и залипшем LIMIT накручивал счётчик
+#      БЕЗ реального запроса (каждый таймаут считался перегрузкой);
+#   3) окно 300 с обновлялось каждым новым вызовом — счётчик никогда не гас.
+# Итог: за 3 таймаута модель «навсегда» помечалась перегруженной и не
+# восстанавливалась до перезапуска процесса. Теперь окно считается от момента
+# ПЕРВОЙ ошибки (и гаснет само), а счётчик растёт только от реальных
+# ответов 429/503 от провайдера.
+
+_OVERLOAD_WINDOW_SEC = int(cfg("OVERLOAD_WINDOW_SEC", "300"))
+_OVERLOAD_THRESHOLD  = int(cfg("OVERLOAD_THRESHOLD",  "3"))
+
+# {model_key: (window_start_ts, error_count)}
+_api_overload_state: dict = {}
 
 def get_overload_warning_message() -> str:
     """Возвращает предупреждающее сообщение о высокой нагрузке на API."""
@@ -1001,22 +1013,39 @@ def get_overload_warning_message() -> str:
     )
 
 def increment_overload(model_key: str) -> None:
-    """Увеличивает счётчик перегрузок для модели."""
-    import time as _time_mod
-    current_time = _time_mod.time()
-    if model_key in _api_overload_timestamps:
-        if current_time - _api_overload_timestamps[model_key] > 300:
-            _api_overload_counter[model_key] = 0
-    _api_overload_counter[model_key] = _api_overload_counter.get(model_key, 0) + 1
-    _api_overload_timestamps[model_key] = current_time
+    """Фиксирует РЕАЛЬНУЮ ошибку 429/503 от провайдера для модели.
+
+    Вызывается ТОЛЬКО из обработчика ответа API. Ни таймауты, ни пропуски
+    вызовов, ни пустые ответы счётчик не увеличивают — иначе модель
+    «умирала» без единого настоящего запроса (см. FIX выше).
+    """
+    now = time.time()
+    window_start, count = _api_overload_state.get(model_key, (0.0, 0))
+    if now - window_start > _OVERLOAD_WINDOW_SEC:
+        window_start, count = now, 0
+    _api_overload_state[model_key] = (window_start, count + 1)
 
 def is_api_overloaded(model_key: str) -> bool:
-    """Проверяет, перегружена ли модель (более 3 ошибок за 5 минут)."""
-    return _api_overload_counter.get(model_key, 0) >= 3
+    """Перегружена ли модель (N реальных 429/503 за окно).
+
+    Окно отсчитывается от первой ошибки и гаснет само по истечении
+    _OVERLOAD_WINDOW_SEC — модель ВСЕГДА восстанавливается сама.
+    """
+    window_start, count = _api_overload_state.get(model_key, (0.0, 0))
+    if time.time() - window_start > _OVERLOAD_WINDOW_SEC:
+        return False
+    return count >= _OVERLOAD_THRESHOLD
 
 def reset_overload(model_key: str) -> None:
     """Сбрасывает счётчик перегрузок при успешном запросе."""
-    _api_overload_counter[model_key] = 0
+    _api_overload_state[model_key] = (time.time(), 0)
+
+def overload_left_seconds(model_key: str) -> int:
+    """Сколько секунд осталось до самовосстановления (для честных сообщений)."""
+    window_start, count = _api_overload_state.get(model_key, (0.0, 0))
+    if count < _OVERLOAD_THRESHOLD:
+        return 0
+    return max(0, int(_OVERLOAD_WINDOW_SEC - (time.time() - window_start)))
 
 
 
@@ -1236,6 +1265,104 @@ AI_MODELS: dict = {
 
 if FREE_MODEL_KEY not in AI_MODELS:
     FREE_MODEL_KEY = "deepseek"
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЗДОРОВЬЕ МОДЕЛЕЙ: cooldown по Retry-After + авто-восстановление _fatal
+# ═══════════════════════════════════════════════════════════════
+# FIX (v3.7, «бот не видит ИИ»): раньше одна ошибка 401/402/403 ставила
+# модели _fatal НАВСЕГДА (до перезапуска процесса), и kb_models() такие
+# модели скрывал. В итоге меню ИИ-моделей могло стать ПУСТЫМ: пользователь
+# видел «Выберите ИИ-модель» без единой кнопки. Теперь:
+#   • _fatal автоматически снимается через MODEL_FATAL_RECOVERY_SEC
+#     (админ пополнил баланс / провайдер починил авторизацию — бот сам
+#     возвращается к работе без перезапуска);
+#   • 429/503 ставят короткий cooldown (по Retry-After провайдера), чтобы
+#     не долбить лимиты, — тоже с гарантированным самовосстановлением;
+#   • модели с ключом НИКОГДА не исчезают из меню: они остаются видимыми
+#     с честной пометкой статуса.
+
+MODEL_FATAL_RECOVERY_SEC = int(cfg("MODEL_FATAL_RECOVERY_SEC", "1800"))  # 30 мин
+MODEL_COOLDOWN_DEFAULT_SEC = int(cfg("MODEL_COOLDOWN_DEFAULT_SEC", "90"))
+
+
+def model_fatal_active(info: dict) -> bool:
+    """Активна ли фатальная блокировка модели (с авто-снятием по времени).
+
+    401/402/403 от провайдера чаще всего означают «нет кредита/ключ отозван»,
+    но бывают и временными (сбои биллинга OpenRouter). Поэтому блокировка
+    автоматически снимается через MODEL_FATAL_RECOVERY_SEC — бот сделает
+    новую попытку и при успехе продолжит работу без перезапуска.
+    """
+    if not info.get("_fatal"):
+        return False
+    ts = float(info.get("_fatal_ts") or 0)
+    if ts and (time.time() - ts) > MODEL_FATAL_RECOVERY_SEC:
+        info["_fatal"] = False
+        info["_fatal_ts"] = 0
+        info["status"] = ModelStatus.UNKNOWN
+        print(f"[MODEL] {info.get('name', '?')}: фатальная блокировка снята по таймауту — пробую снова")
+        return False
+    return True
+
+
+def model_in_cooldown(info: dict) -> bool:
+    """Стоит ли модель на cooldown (например, после 429 с Retry-After)."""
+    return time.time() < float(info.get("_cooldown_until") or 0)
+
+
+def model_cooldown_left(info: dict) -> int:
+    """Сколько секунд осталось до конца cooldown модели."""
+    return max(0, int(float(info.get("_cooldown_until") or 0) - time.time()))
+
+
+def _set_model_cooldown(info: dict, seconds: float) -> None:
+    """Ставит модель на cooldown на указанное число секунд (минимум 5 с)."""
+    info["_cooldown_until"] = time.time() + max(5.0, float(seconds))
+
+
+def model_menu_status_label(info: dict) -> str:
+    """Честная пометка состояния модели для меню (никогда не скрываем модель)."""
+    if model_fatal_active(info):
+        left = MODEL_FATAL_RECOVERY_SEC - int(time.time() - float(info.get("_fatal_ts") or 0))
+        mins = max(1, left // 60)
+        return f"🔴 ошибка (авто-повтор ~{mins} мин)"
+    if model_in_cooldown(info):
+        return f"❌ лимит (~{max(1, model_cooldown_left(info)) // 60 + 1} мин)"
+    if is_api_overloaded(_model_key_of(info)):
+        left = overload_left_seconds(_model_key_of(info))
+        return f"❌ лимит (~{max(1, left // 60) + 1} мин)"
+    st = info.get("status", ModelStatus.UNKNOWN)
+    # FIX (v3.7): «залипший» LIMIT — показываем его честно не дольше 10 минут
+    # после последней ошибки, дальше возвращаем ❓ (модель снова можно пробовать).
+    if st == ModelStatus.LIMIT:
+        ts = float(info.get("_status_ts") or 0)
+        if not ts or (time.time() - ts) > 600:
+            return ModelStatus.UNKNOWN
+    return st
+
+
+def _set_model_status(info: dict, status: str) -> None:
+    """Проставляет статус модели со штампом времени (для гашения LIMIT)."""
+    info["status"] = status
+    info["_status_ts"] = time.time()
+
+
+def _model_key_of(info: dict) -> str:
+    """Обратный lookup ключа модели по её dict (для счётчиков перегрузки)."""
+    for k, v in AI_MODELS.items():
+        if v is info:
+            return k
+    return next(
+        (k for k, v in AI_MODELS.items()
+         if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")),
+        "unknown",
+    )
+
+
+def has_enabled_models() -> bool:
+    """Есть ли хотя бы одна модель с настроенным API-ключом."""
+    return any(bool(v.get("api_key")) for v in AI_MODELS.values())
 
 
 def _strip_markdown_markers(text: str) -> str:
@@ -1668,8 +1795,13 @@ async def call_openai_compat(
     max_tokens: int = 4096,
     timeout: int = 300,
 ) -> str:
-    """Вызов OpenAI-совместимого API."""
-    if info.get("_fatal") or not info.get("api_key"):
+    """Вызов OpenAI-совместимого API.
+
+    FIX (v3.7): учитываем здоровье модели — _fatal (с авто-снятием) и
+    cooldown после 429/503. В обоих случаях возвращаем "" мгновенно,
+    НЕ выполняя HTTP-запрос и НЕ накручивая счётчик перегрузок.
+    """
+    if model_fatal_active(info) or model_in_cooldown(info) or not info.get("api_key"):
         return ""
 
     base    = info["base_url"].rstrip("/")
@@ -1737,23 +1869,33 @@ async def call_openai_compat(
                             finish = c2.get("finish_reason") or ""
                     return content
                 if r.status in (401, 402, 403):
+                    # FIX (v3.7): _fatal теперь с авто-снятием через
+                    # MODEL_FATAL_RECOVERY_SEC — модель вернётся в строй сама
+                    # (например, после пополнения баланса) без перезапуска бота.
                     info["_fatal"] = True
-                    info["status"] = ModelStatus.FATAL
-                    print(f"[FATAL] {info['name']} — auth error {r.status}")
+                    info["_fatal_ts"] = time.time()
+                    _set_model_status(info, ModelStatus.FATAL)
+                    print(f"[FATAL] {info['name']} — auth error {r.status} "
+                          f"(авто-повтор через {MODEL_FATAL_RECOVERY_SEC // 60} мин)")
                 elif r.status == 429:
-                    info["status"] = ModelStatus.LIMIT
-                    # Отслеживание перегрузки API
-                    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-                    increment_overload(model_key)
-                    print(f"[LIMIT] {info['name']} — rate limit (API overload detected)")
+                    # FIX (v3.7): уважаем Retry-After провайдера — ставим короткий
+                    # cooldown вместо вечного «залипшего» LIMIT. Запросы в это
+                    # время мгновенно уходят на фоллбэк-модели, лимит не добивается.
+                    retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+                    _set_model_status(info, ModelStatus.LIMIT)
+                    _set_model_cooldown(info, retry_after)
+                    increment_overload(_model_key_of(info))
+                    print(f"[LIMIT] {info['name']} — rate limit, cooldown {retry_after:.0f} с")
                 elif r.status == 503:
-                    info["status"] = ModelStatus.LIMIT
-                    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-                    increment_overload(model_key)
-                    print(f"[OVERLOAD] {info['name']} — service unavailable")
+                    _set_model_status(info, ModelStatus.LIMIT)
+                    _set_model_cooldown(info, 30)
+                    increment_overload(_model_key_of(info))
+                    print(f"[OVERLOAD] {info['name']} — service unavailable, cooldown 30 с")
                 else:
                     print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
     except asyncio.TimeoutError:
+        # FIX (v3.7): таймаут больше НЕ считается перегрузкой (не увеличивает
+        # счётчик) — раньше 3 таймаута «убивали» модель навсегда.
         print(f"[TIMEOUT] {info['name']}")
     except Exception as e:
         print(f"[ERR] {info['name']}: {e}")
@@ -1761,27 +1903,42 @@ async def call_openai_compat(
     return ""
 
 
+def _parse_retry_after(value) -> float:
+    """Парсит заголовок Retry-After (секунды или HTTP-дата).
+
+    Некорректное/отсутствующее значение → MODEL_COOLDOWN_DEFAULT_SEC.
+    """
+    try:
+        if not value:
+            return float(MODEL_COOLDOWN_DEFAULT_SEC)
+        return max(5.0, float(str(value).strip()))
+    except (TypeError, ValueError):
+        return float(MODEL_COOLDOWN_DEFAULT_SEC)
+
+
 async def chat_with_model(info: dict, messages: list[dict], max_tokens: int = 4096) -> str:
-    """Вызывает модель. При перегрузке возвращает пустую строку."""
-    # Определяем ключ модели для проверки перегрузки
-    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-    
-    # Проверяем, не перегружена ли модель
-    if is_api_overloaded(model_key):
-        print(f"[OVERLOAD] Модель {info.get('name', model_key)} перегружена, пропускаем...")
-        info["status"] = ModelStatus.LIMIT
+    """Вызывает модель. При недоступности возвращает пустую строку.
+
+    FIX (v3.7, «смертная спираль»): счётчик перегрузки накручивается
+    ТОЛЬКО реальными 429/503 от провайдера (внутри call_openai_compat).
+    Таймауты, пропуски и пустые ответы счётчик НЕ увеличивают — иначе
+    модель помечалась перегруженной навсегда и бот «переставал видеть ИИ».
+    """
+    model_key = _model_key_of(info)
+
+    # Короткое замыкание: модель стоит на cooldown после 429/503 —
+    # не долбим провайдера, сразу отдаём ход фоллбэк-моделям.
+    if model_in_cooldown(info):
+        print(f"[COOLDOWN] {info.get('name', model_key)} на паузе ещё "
+              f"{model_cooldown_left(info)} с — пропускаю без запроса")
         return ""
-    
+
     raw = await call_openai_compat(info, messages, max_tokens=max_tokens)
-    
-    # Если вернулась пустая строка и статус LIMIT — возможно перегрузка
-    if not raw and info.get("status") == ModelStatus.LIMIT:
-        increment_overload(model_key)
-    
+
     # Успешный ответ — сбрасываем счётчик перегрузок
     if raw and len(raw.strip()) > 100:
         reset_overload(model_key)
-    
+
     return _normalize_homoglyphs(sanitize_llm_text(raw))
 
 
@@ -1790,10 +1947,17 @@ def fallback_chain(primary: str) -> list[str]:
 
     Раньше использовался только OpenRouter (deepseek_r1, gemini_or), из-за
     чего при сбое OpenRouter Groq и прямой DeepSeek API не подхватывались.
-    Теперь честно перебираем все модели, у которых есть api_key и нет
-    фатальной ошибки. Дубликаты не добавляются.
+
+    FIX (v3.7, «бот не видит ИИ»):
+      • модели на cooldown идут В КОНЦЕ цепочки (а не выбрасываются):
+        их вызов мгновенно замыкается без HTTP, поэтому они ничего не
+        ломают, но дают шанс дожать генерацию, если cooldown истёк;
+      • _fatal учитывается только пока АКТИВЕН (авто-снимается по времени);
+      • если ВСЕ модели заблокированы — цепочка всё равно НЕ пустует:
+        возвращаем [primary], чтобы попытка состоялась (call_openai_compat
+        сам снимет истёкшую блокировку и честно вернёт ошибку, если
+        провайдер всё ещё недоступен).
     """
-    # Полный приоритет: сначала primary, затем — в порядке предпочтения.
     priority = [
         primary,
         "deepseek",      # прямой DeepSeek API (дешёвый, стабильный)
@@ -1802,17 +1966,26 @@ def fallback_chain(primary: str) -> list[str]:
         "groq",          # Groq (быстрый, бесплатный)
     ]
     out: list[str] = []
+    deferred: list[str] = []   # модели на cooldown — в конец цепочки
     for k in priority:
-        if not k or k in out:
+        if not k or k in out or k in deferred:
             continue
         info = AI_MODELS.get(k)
-        if not info:
+        if not info or not info.get("api_key"):
             continue
-        if info.get("_fatal"):
+        if model_fatal_active(info):
             continue
-        if not info.get("api_key"):
+        if model_in_cooldown(info) or is_api_overloaded(k):
+            deferred.append(k)
             continue
         out.append(k)
+    out.extend(deferred)
+    if not out:
+        # Последний шанс: даже «умершая» primary — лучше попытка, чем
+        # пустая цепочка (иначе генерация падает мгновенно и без диагностики).
+        first = primary if primary in AI_MODELS else next(iter(AI_MODELS))
+        out = [first]
+        print(f"[FALLBACK] Все модели заблокированы — последняя попытка через {first}")
     return out
 
 
@@ -1955,11 +2128,11 @@ async def chat_with_fallback(
                 model=k,
                 exc_info=_api_e,
             )
-            info["status"] = ModelStatus.LIMIT
+            _set_model_status(info, ModelStatus.LIMIT)
             print(f"[FALLBACK] Модель {info.get('name', k)} упала с ошибкой: {_api_e}")
             text = ""
         if text and len(text.strip()) > 100:
-            info["status"] = ModelStatus.AVAILABLE
+            _set_model_status(info, ModelStatus.AVAILABLE)
             log_error(
                 stage="api_success",
                 message=f"Модель {info.get('name', k)} ответила успешно",
@@ -1971,7 +2144,7 @@ async def chat_with_fallback(
             best_text = text
             best_model = k
         if not text:
-            info["status"] = ModelStatus.LIMIT
+            _set_model_status(info, ModelStatus.LIMIT)
             log_error(
                 stage="api_fallback",
                 message=f"Модель {info.get('name', k)} вернула пустой ответ, пробую следующую...",
@@ -10925,17 +11098,58 @@ def _edit_price_notice(user_id: int) -> str:
 
 
 def kb_models() -> InlineKeyboardMarkup:
+    """Меню выбора ИИ-модели (платный режим).
+
+    FIX (v3.7, «бот не видит ИИ»): модель с настроенным ключом БОЛЬШЕ
+    НЕ ИСЧЕЗАЕТ из меню ни при каких ошибках — раньше одна 401/402/403
+    навсегда прятала кнопку, и меню могло опустеть. Теперь модель всегда
+    видна, а её текущее состояние видно по честной пометке справа
+    (❓ / ✅ / ❌ лимит с ETA / 🔴 ошибка с ETA авто-повтора).
+    """
     b = InlineKeyboardBuilder()
     for k, info in AI_MODELS.items():
-        if not info.get("api_key") or info.get("_fatal"):
+        if not info.get("api_key"):
             continue
-        status = info.get("status", ModelStatus.UNKNOWN)
+        status = model_menu_status_label(info)
         b.button(
             text=f"{info['name']}  {info['price_per_page']}⭐/стр  {status}",
             callback_data=f"model_{k}",
         )
     b.adjust(1)
     return b.as_markup()
+
+
+def kb_models_or_free_hint() -> InlineKeyboardMarkup | None:
+    """Меню моделей, а если ключей нет вообще — None (показываем честный текст)."""
+    if not has_enabled_models():
+        return None
+    return kb_models()
+
+
+def no_models_configured_text() -> str:
+    """Честное объяснение вместо пустого меню моделей."""
+    return (
+        "⚠️ <b>ИИ-модели не настроены на сервере</b>\n\n"
+        "В bot_config.json не заполнен ни один API-ключ: "
+        "<code>DEEPSEEK_KEY</code>, <code>GROQ_KEY</code> или <code>OPENROUTER_KEY</code>.\n\n"
+        "Администратору бота нужно добавить хотя бы один ключ и перезапустить "
+        "бота — после этого выбор моделей появится автоматически.\n\n"
+        "А пока можно попробовать бесплатный режим."
+    )
+
+
+def model_menu_message(default_text: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Единая точка рендера меню выбора ИИ-модели.
+
+    FIX (v3.7): раньше при отсутствии ключей kb_models() возвращал ПУСТУЮ
+    клавиатуру — пользователь видел заголовок «Выберите ИИ-модель» без
+    единой кнопки («бот не видит ИИ»). Теперь в этом случае показываем
+    честное объяснение и навигацию вместо немого пустого меню.
+    """
+    markup = kb_models_or_free_hint()
+    if markup is None:
+        return no_models_configured_text(), kb_back_cancel()
+    return default_text, with_back(markup)
 
 
 def kb_cancel() -> InlineKeyboardMarkup:
@@ -12555,13 +12769,12 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
             WorkState.page_number_position,
         )
     elif cur == WorkState.payment.state:
-        await edit(
+        _mtxt, _mkup = model_menu_message(
             "🤖 <b>Выберите ИИ-модель</b>\n\n"
             "Цена указана в звёздах Telegram за страницу.\n"
-            "Все модели генерируют полноценный академический текст.",
-            with_back(kb_models()),
-            WorkState.model,
+            "Все модели генерируют полноценный академический текст."
         )
+        await edit(_mtxt, _mkup, WorkState.model)
     else:
         first = cb.from_user.first_name or "пользователь"
         await cb.message.edit_text(
@@ -13443,13 +13656,16 @@ async def _continue_after_image_choice(cb: CallbackQuery, state: FSMContext) -> 
         f"\n🖼 Изображения включены: +{IMAGES_EXTRA_PRICE_PER_PAGE}⭐/стр."
         if include_images else "\n📄 Изображения отключены."
     )
-    await cb.message.edit_text(
+    _mtxt, _mkup = model_menu_message(
         "🤖 <b>Выберите ИИ-модель</b>\n\n"
         "Цена указана в звёздах Telegram за страницу.\n"
         "Текст будет без опечаток, с живым человеческим стилем и без "
         "фраз-маркеров ИИ."
-        f"{image_note}",
-        reply_markup=with_back(kb_models()),
+        f"{image_note}"
+    )
+    await cb.message.edit_text(
+        _mtxt,
+        reply_markup=_mkup,
         parse_mode="HTML",
     )
     await state.set_state(WorkState.model)
@@ -13689,9 +13905,12 @@ async def h_image_count_text(message: Message, state: FSMContext) -> None:
         await message.answer(reason, parse_mode="HTML")
         await state.clear()
         return
+    _mtxt, _mkup = model_menu_message(
+        f"✅ Фото: <b>{count}</b> шт.\n\n🤖 <b>Выберите ИИ-модель</b>"
+    )
     await message.answer(
-        f"✅ Фото: <b>{count}</b> шт.\n\n🤖 <b>Выберите ИИ-модель</b>",
-        reply_markup=with_back(kb_models()),
+        _mtxt,
+        reply_markup=_mkup,
         parse_mode="HTML",
     )
     await state.set_state(WorkState.model)
@@ -13732,11 +13951,14 @@ async def h_output_format(cb: CallbackQuery, state: FSMContext) -> None:
         await generate_and_send(cb.message, state, model_key=FREE_MODEL_KEY, pay_mode="free")
         return
 
-    await cb.message.edit_text(
+    _mtxt, _mkup = model_menu_message(
         "🤖 <b>Выберите ИИ-модель</b>\n\n"
         "Цена указана в звёздах Telegram за страницу.\n"
-        "Все модели генерируют полноценный академический текст.",
-        reply_markup=with_back(kb_models()),
+        "Все модели генерируют полноценный академический текст."
+    )
+    await cb.message.edit_text(
+        _mtxt,
+        reply_markup=_mkup,
         parse_mode="HTML",
     )
     await state.set_state(WorkState.model)
@@ -13746,9 +13968,18 @@ async def h_output_format(cb: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("model_"))
 async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
     model_key = cb.data.replace("model_", "", 1)
-    if model_key not in AI_MODELS or not AI_MODELS[model_key].get("api_key"):
+    if model_key not in AI_MODELS:
         await cb.answer("⚠️ Модель временно недоступна", show_alert=True)
         return
+    if not AI_MODELS[model_key].get("api_key"):
+        await cb.answer(
+            "⚠️ У этой модели не настроен API-ключ на сервере — выберите другую",
+            show_alert=True,
+        )
+        return
+    # Модели в cooldown/_fatal ОСТАЮТСЯ доступными для выбора: пользователь
+    # выбрал их осознанно, а fallback-цепочка при сбое сама перейдёт на
+    # следующую модель (и блокировки к тому моменту могут уже сняться).
 
     data  = await state.get_data()
     pages = int(data.get("pages", 10))
@@ -13799,9 +14030,10 @@ async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "back_to_models")
 async def h_back_to_models(cb: CallbackQuery, state: FSMContext) -> None:
+    _mtxt, _mkup = model_menu_message("🤖 <b>Выберите ИИ-модель</b>")
     await cb.message.edit_text(
-        "🤖 <b>Выберите ИИ-модель</b>",
-        reply_markup=with_back(kb_models()),
+        _mtxt,
+        reply_markup=_mkup,
         parse_mode="HTML",
     )
     await state.set_state(WorkState.model)
@@ -14671,10 +14903,26 @@ async def generate_and_send(
 
         except Exception as e:
             print(f"[GEN ERROR] {e}")
+            # FIX (v3.7): добавляем честную диагностику состояния моделей,
+            # чтобы «Ошибка генерации» не выглядела как «бот перестал видеть ИИ»:
+            # видно, какая модель в лимите/ошибке и когда она восстановится.
+            try:
+                _diag = "; ".join(
+                    f"{v.get('name', k)} — {model_menu_status_label(v)}"
+                    for k, v in AI_MODELS.items() if v.get("api_key")
+                )
+            except Exception:
+                _diag = ""
+            _hint = (
+                f"\n\n<b>Состояние ИИ-моделей:</b> {_diag}\n"
+                "Модели с пометкой «лимит/ошибка» восстанавливаются автоматически."
+                if _diag else ""
+            )
             await prog.finish(
                 "❌ <b>Ошибка генерации</b>\n\n"
                 f"Причина: {str(e)[:200]}\n\n"
                 "Попробуйте ещё раз или выберите другую модель (/start)."
+                f"{_hint}"
             )
             await state.clear()
             await _gen_slot_release(_uid)
@@ -14782,7 +15030,9 @@ async def main() -> None:
     print(f"  Alerts      : {'✅ → chat ' + _admin_chat if _admin_chat else '❌ ADMIN_CHAT_ID не задан'}")
 
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v3.0-gost")
+    print("  🤖  ГОСТ-АССИСТЕНТ v3.7-gost")
+    _models_ok = [v.get('name', k) for k, v in AI_MODELS.items() if v.get('api_key')]
+    print(f"  AI-модели   : {', '.join(_models_ok) if _models_ok else '❌ НИ ОДНОЙ (заполните ключи в bot_config.json!)'}")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")

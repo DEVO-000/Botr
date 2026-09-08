@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# GOST-ASSISTANT v3.7 — «академический эксперт»: реальные источники из 10+ каталогов,
+# GOST-ASSISTANT v3.8 — «академический эксперт»: реальные источники из 10+ каталогов,
 # честная библиография без фабрикаций, ГОСТ 7.32-2017 / Р 7.0.100-2018 / Р 7.0.5-2008.
 # История изменений: см. CHANGES.md
 
@@ -113,6 +113,71 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from urllib.parse import quote_plus
+
+# ═══════════════════════════════════════════════════════════════
+#  FIX (v3.8, «бот не видит ИИ»): ПОДДЕРЖКА ФАЙЛА .env
+#  Инструкция (НАСТРОЙКА_И_ЗАПУСК.txt) обещала «Вариант A — файл .env
+#  (проще всего)», но код его НИКОГДА не читал: пользователь складывал
+#  ключи в .env рядом с main.py, а бот честно отвечал «ИИ-модели
+#  не настроены». Теперь .env реально читается.
+# ═══════════════════════════════════════════════════════════════
+
+# Все конфиги/файлы данных ищем в ПАПКЕ СКРИПТА, а не в текущей папке запуска:
+# при запуске «python /path/bot/main.py» из другого каталога (панели хостинга,
+# systemd, screen) старые относительные пути не находили bot_config.json рядом
+# с main.py — бот снова «не видел ИИ».
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_env_file() -> None:
+    """Читает .env в os.environ. Без внешних зависимостей (аналог python-dotenv).
+
+    Правила:
+      • читаем .env из папки main.py и из текущей папки запуска (если они разные);
+      • НЕ перезаписываем уже заданные переменные окружения хостинга —
+        они приоритетнее (совпадает с обещанной документацией);
+      • поддерживаем кавычки значений, комментарии #, пустые строки, BOM.
+    """
+    seen: set[str] = set()
+    for env_path in (
+        os.path.join(BASE_DIR, ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ):
+        try:
+            if not env_path or env_path in seen or not os.path.isfile(env_path):
+                continue
+            seen.add(env_path)
+            loaded = 0
+            with open(env_path, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip()
+                    if val[:1] in ("'", '"'):
+                        # значение в кавычках: берём содержимое до закрывающей
+                        # кавычки, хвост (в т.ч. комментарий) отбрасываем
+                        q = val[0]
+                        end = val.find(q, 1)
+                        val = val[1:end] if end != -1 else val[1:]
+                    elif " #" in val:  # значение с хвостовым комментарием: KEY=value # комментарий
+                        val = val.split(" #", 1)[0].strip()
+                    if key and val:
+                        # заполняем только если переменная отсутствует ИЛИ пустая:
+                        # пустые переменные от панелей хостинга не должны
+                        # блокировать ключи из .env
+                        if not os.environ.get(key):
+                            os.environ[key] = val
+                            loaded += 1
+            if loaded:
+                print(f"[ENV] Загружен {env_path} ({loaded} пер.)")
+        except Exception as e:
+            print(f"[WARN] Не удалось прочитать {env_path}: {e}")
+
+
+_load_env_file()
 
 import aiohttp
 from aiohttp import web
@@ -390,20 +455,30 @@ TOKENS = {
     "VIP_USERS": "5291613279",
 }
 
-CONFIG_FILE      = "bot_config.json"
-GOST_CONFIG_FILE = "gost_configs.json"
-USAGE_FILE       = "usage_limits.json"
-NUMERIC_FACTS_FILE = "numeric_facts.json"
+# FIX (v3.8): абсолютные пути от папки main.py — конфиг находится при любом CWD
+CONFIG_FILE      = os.path.join(BASE_DIR, "bot_config.json")
+GOST_CONFIG_FILE = os.path.join(BASE_DIR, "gost_configs.json")
+USAGE_FILE       = os.path.join(BASE_DIR, "usage_limits.json")
+NUMERIC_FACTS_FILE = os.path.join(BASE_DIR, "numeric_facts.json")
 
 
 def _load_json(path: str, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+    # FIX (v3.8): если файла нет рядом с main.py, пробуем текущую папку запуска —
+    # у части пользователей рабочий CWD отличается (панели хостинга, systemd),
+    # а старые файлы могли создаться именно там.
+    candidates = [path]
+    alt = os.path.join(os.getcwd(), os.path.basename(path))
+    if alt != path:
+        candidates.append(alt)
+    for cand in candidates:
+        if not os.path.exists(cand):
+            continue
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
 
 
 def _save_json(path: str, data) -> None:
@@ -11127,13 +11202,26 @@ def kb_models_or_free_hint() -> InlineKeyboardMarkup | None:
 
 
 def no_models_configured_text() -> str:
-    """Честное объяснение вместо пустого меню моделей."""
+    """Честное объяснение вместо пустого меню моделей.
+
+    FIX (v3.8): добавлена диагностика источников конфигурации — пользователь
+    сразу видит, что именно бот нашёл (или не нашёл): .env, bot_config.json.
+    """
+    env_found = os.path.isfile(os.path.join(BASE_DIR, ".env"))
+    cfg_found = bool(CONFIG)
+    diag = (
+        (".env найден, но ключей ИИ в нём нет" if env_found else ".env не найден рядом с main.py")
+        + "; "
+        + ("bot_config.json найден, но ключи ИИ не заполнены" if cfg_found else "bot_config.json не найден рядом с main.py")
+    )
     return (
         "⚠️ <b>ИИ-модели не настроены на сервере</b>\n\n"
-        "В bot_config.json не заполнен ни один API-ключ: "
-        "<code>DEEPSEEK_KEY</code>, <code>GROQ_KEY</code> или <code>OPENROUTER_KEY</code>.\n\n"
-        "Администратору бота нужно добавить хотя бы один ключ и перезапустить "
-        "бота — после этого выбор моделей появится автоматически.\n\n"
+        "Не заполнен ни один API-ключ: <code>DEEPSEEK_KEY</code>, "
+        "<code>GROQ_KEY</code> или <code>OPENROUTER_KEY</code>.\n\n"
+        f"🔍 <b>Диагностика:</b> {diag}.\n\n"
+        "Администратору: впишите ключи в файл <code>.env</code> или "
+        "<code>bot_config.json</code> рядом с main.py и перезапустите бота — "
+        "выбор моделей появится автоматически.\n\n"
         "А пока можно попробовать бесплатный режим."
     )
 
@@ -15016,8 +15104,8 @@ async def main() -> None:
     global bot
     if not BOT_TOKEN:
         raise SystemExit(
-            "❌ ОШИБКА: не задан BOT_TOKEN. Укажите его в переменной окружения "
-            "BOT_TOKEN или в bot_config.json."
+            "❌ ОШИБКА: не задан BOT_TOKEN. Укажите его в файле .env, "
+            "bot_config.json (рядом с main.py) или в переменной окружения BOT_TOKEN."
         )
     bot = Bot(token=BOT_TOKEN)
 
@@ -15030,9 +15118,10 @@ async def main() -> None:
     print(f"  Alerts      : {'✅ → chat ' + _admin_chat if _admin_chat else '❌ ADMIN_CHAT_ID не задан'}")
 
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v3.7-gost")
+    print("  🤖  ГОСТ-АССИСТЕНТ v3.8-gost")
     _models_ok = [v.get('name', k) for k, v in AI_MODELS.items() if v.get('api_key')]
-    print(f"  AI-модели   : {', '.join(_models_ok) if _models_ok else '❌ НИ ОДНОЙ (заполните ключи в bot_config.json!)'}")
+    print(f"  AI-модели   : {', '.join(_models_ok) if _models_ok else '❌ НИ ОДНОЙ (впишите DEEPSEEK_KEY/OPENROUTER_KEY/GROQ_KEY в .env или bot_config.json рядом с main.py!)'}")
+    print(f"  Конфиг      : bot_config.json {'✅' if CONFIG else '— не найден'}; .env {'✅' if os.path.isfile(os.path.join(BASE_DIR, '.env')) else '— не найден'}; папка: {BASE_DIR}")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")

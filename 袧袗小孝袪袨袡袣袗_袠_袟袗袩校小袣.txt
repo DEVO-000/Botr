@@ -5,9 +5,14 @@
   - requirements.txt
   - gost_configs.json
   - apt.txt (если хостинг умеет ставить системные пакеты, напр. Render/Railway)
-  - bot_config.example.json (переименуйте в bot_config.json и вставьте ключи — см. ниже)
+  - .env.example или bot_config.example.json — шаблоны ключей (см. ниже)
 
 Загружать НЕ нужно: __pycache__, папки с тестами (test_*.py можно, они не мешают).
+
+ВАЖНО (v3.8): файлы .env и bot_config.json ищутся РЯДОМ с main.py —
+запускать бота можно из ЛЮБОЙ папки (python /путь/к/main.py), конфиг
+найдётся. Если бот пишет «ИИ-модели не настроены» при заполненных ключах —
+проверьте, что .env / bot_config.json лежат именно рядом с main.py.
 
 === ГДЕ ВЗЯТЬ КЛЮЧИ (ИИ-МОДЕЛИ) ===
 
@@ -21,10 +26,12 @@
 кода, а отсутствие ключей.
 
 Вариант A — файл .env (проще всего):
+  возьмите .env.example, переименуйте в .env и впишите ключи:
   BOT_TOKEN=123456789:ВАШ_ТОКЕН
   DEEPSEEK_KEY=sk-...
   OPENROUTER_KEY=sk-or-...
   GROQ_KEY=gsk_...
+  Кавычки не обязательны; строки с # — комментарии.
 
 Вариант B — файл bot_config.json:
   возьмите bot_config.example.json, переименуйте в bot_config.json
